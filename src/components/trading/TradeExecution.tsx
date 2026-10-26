@@ -19,6 +19,24 @@ interface MarketSymbol {
   status: string;
 }
 
+const inputStyle: React.CSSProperties = {
+  width: '100%',
+  padding: '10px',
+  background: '#0a0a0f',
+  border: '1px solid #2a2a3a',
+  borderRadius: '8px',
+  color: '#ffffff',
+  outline: 'none',
+  boxSizing: 'border-box',
+};
+
+const labelStyle: React.CSSProperties = {
+  display: 'block',
+  color: '#9ca3af',
+  fontSize: '14px',
+  marginBottom: '4px',
+};
+
 export default function TradeExecution() {
   const [connections, setConnections] = useState<BrokerConnection[]>([]);
   const [connectionId, setConnectionId] = useState<number | null>(null);
@@ -27,6 +45,9 @@ export default function TradeExecution() {
   const [loading, setLoading] = useState<'buy' | 'sell' | null>(null);
   const [loadingSymbols, setLoadingSymbols] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
+  const [stopLoss, setStopLoss] = useState('');
+  const [takeProfit, setTakeProfit] = useState('');
+  const [currentPrice, setCurrentPrice] = useState<number | null>(null);
 
   useEffect(() => {
     const fetchConnections = async () => {
@@ -49,6 +70,9 @@ export default function TradeExecution() {
   useEffect(() => {
     setSymbols([]);
     setSymbol('');
+    setStopLoss('');
+    setTakeProfit('');
+    setCurrentPrice(null);
 
     if (!connectionId) {
       setLoadingSymbols(false);
@@ -64,9 +88,7 @@ export default function TradeExecution() {
         const data = response.data ?? [];
         setSymbols(data);
         setSymbol((current) =>
-          current && data.some((x) => x.symbol === current)
-            ? current
-            : data[0]?.symbol ?? ''
+          current && data.some((x) => x.symbol === current) ? current : data[0]?.symbol ?? ''
         );
       } catch (error: any) {
         console.error('Failed to fetch symbols', error);
@@ -80,6 +102,34 @@ export default function TradeExecution() {
     return () => window.clearTimeout(timer);
   }, [connectionId, searchTerm]);
 
+  useEffect(() => {
+    if (!symbol) {
+      setCurrentPrice(null);
+      return;
+    }
+    let cancelled = false;
+    const fetchPrice = async () => {
+      try {
+        const res = await fetch(
+          `https://api.bybit.com/v5/market/tickers?category=spot&symbol=${symbol}`
+        );
+        const data = await res.json();
+        if (!cancelled && data?.retCode === 0 && data?.result?.list?.length > 0) {
+          const price = parseFloat(data.result.list[0].ask1Price);
+          if (!isNaN(price) && price > 0) setCurrentPrice(price);
+        }
+      } catch {
+        /* best effort */
+      }
+    };
+    fetchPrice();
+    const interval = window.setInterval(fetchPrice, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [symbol]);
+
   const selectedConnection = useMemo(
     () => connections.find((x) => x.id === connectionId) ?? null,
     [connections, connectionId]
@@ -90,26 +140,75 @@ export default function TradeExecution() {
       toast.error('Select a connected broker first');
       return;
     }
-
     if (!symbol) {
       toast.error('Select a trading symbol');
       return;
     }
 
+    const hasSL = stopLoss.trim().length > 0;
+    const hasTP = takeProfit.trim().length > 0;
+    const useProtection = side === 'buy' && (hasSL || hasTP);
+
+    let slValue: number | undefined;
+    let tpValue: number | undefined;
+    let entryPriceValue: number | undefined;
+
+    if (useProtection) {
+      if (currentPrice === null) {
+        toast.error('Current price not available yet. Wait a moment and try again.');
+        return;
+      }
+      entryPriceValue = parseFloat((currentPrice + 1).toFixed(1));
+
+      if (hasSL) {
+        slValue = parseFloat(stopLoss);
+        if (isNaN(slValue) || slValue <= 0) {
+          toast.error('Invalid stop-loss value.');
+          return;
+        }
+        if (slValue >= entryPriceValue) {
+          toast.error('Stop-loss must be below the entry price for a BUY.');
+          return;
+        }
+      }
+      if (hasTP) {
+        tpValue = parseFloat(takeProfit);
+        if (isNaN(tpValue) || tpValue <= 0) {
+          toast.error('Invalid take-profit value.');
+          return;
+        }
+        if (tpValue <= entryPriceValue) {
+          toast.error('Take-profit must be above the entry price for a BUY.');
+          return;
+        }
+      }
+    }
+
     setLoading(side);
     try {
-      const response = await api.post('/trading/place-order', {
+      const payload: Record<string, unknown> = {
         connectionId: selectedConnection.id,
         symbol,
         direction: side.toUpperCase(),
-        orderType: 'Market',
+        orderType: useProtection ? 'Limit' : 'Market',
         useFutures: false,
-      }, {
+      };
+      if (useProtection) {
+        payload.entryPrice = entryPriceValue;
+        if (slValue !== undefined) payload.stopLoss = slValue;
+        if (tpValue !== undefined) payload.takeProfit = tpValue;
+      }
+
+      const response = await api.post('/trading/place-order', payload, {
         headers: { 'Idempotency-Key': crypto.randomUUID() },
       });
 
       if (response.data.success) {
-        toast.success(`${side.toUpperCase()} ${symbol} submitted successfully.`);
+        toast.success(
+          useProtection
+            ? `${side.toUpperCase()} ${symbol} submitted. Protection orders will be placed after the entry fills.`
+            : `${side.toUpperCase()} ${symbol} submitted successfully.`
+        );
       } else {
         toast.error(response.data.message || 'Order failed');
       }
@@ -128,29 +227,162 @@ export default function TradeExecution() {
       </p>
 
       <div style={{ marginBottom: '12px' }}>
-        <label style={{ display: 'block', color: '#9ca3af', fontSize: '14px', marginBottom: '4px' }}>Broker</label>
-        <select value={connectionId ?? ''} onChange={(e) => setConnectionId(Number(e.target.value))} disabled={connections.length === 0} style={{ width: '100%', padding: '10px', background: '#0a0a0f', border: '1px solid #2a2a3a', borderRadius: '8px', color: '#ffffff', outline: 'none' }}>
-          {connections.length === 0 ? <option value="">No connected brokers</option> : connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.brokerName} · {connection.isTestnet ? 'TESTNET' : 'LIVE'}</option>)}
+        <label style={labelStyle}>Broker</label>
+        <select
+          value={connectionId ?? ''}
+          onChange={(e) => setConnectionId(Number(e.target.value))}
+          disabled={connections.length === 0}
+          style={inputStyle}
+        >
+          {connections.length === 0 ? (
+            <option value="">No connected brokers</option>
+          ) : (
+            connections.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.brokerName} · {c.isTestnet ? 'TESTNET' : 'LIVE'}
+              </option>
+            ))
+          )}
         </select>
       </div>
 
       <div style={{ marginBottom: '12px' }}>
-        <label style={{ display: 'block', color: '#9ca3af', fontSize: '14px', marginBottom: '4px' }}>Search Symbol</label>
-        <input type="text" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value.toUpperCase())} placeholder="Search BTC, ETH, SOL..." style={{ width: '100%', padding: '10px', background: '#0a0a0f', border: '1px solid #2a2a3a', borderRadius: '8px', color: '#ffffff', outline: 'none', boxSizing: 'border-box' }} />
+        <label style={labelStyle}>Search Symbol</label>
+        <input
+          type="text"
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value.toUpperCase())}
+          placeholder="Search BTC, ETH, SOL..."
+          style={inputStyle}
+        />
       </div>
 
       <div style={{ marginBottom: '12px' }}>
-        <label style={{ display: 'block', color: '#9ca3af', fontSize: '14px', marginBottom: '4px' }}>Select Symbol {symbols.length > 0 ? `(${symbols.length})` : ''}</label>
-        {loadingSymbols ? <p style={{ color: '#9ca3af' }}>Loading real exchange symbols...</p> : (
-          <select value={symbol} onChange={(e) => setSymbol(e.target.value)} disabled={symbols.length === 0} style={{ width: '100%', padding: '10px', background: '#0a0a0f', border: '1px solid #2a2a3a', borderRadius: '8px', color: '#ffffff', outline: 'none' }} size={Math.min(8, Math.max(3, symbols.length))}>
-            {symbols.length === 0 ? <option value="">No symbols found</option> : symbols.map((item) => <option key={item.symbol} value={item.symbol}>{item.symbol} · {item.baseAsset}/{item.quoteAsset}</option>)}
+        <label style={labelStyle}>
+          Select Symbol {symbols.length > 0 ? `(${symbols.length})` : ''}
+        </label>
+        {loadingSymbols ? (
+          <p style={{ color: '#9ca3af' }}>Loading real exchange symbols...</p>
+        ) : (
+          <select
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value)}
+            disabled={symbols.length === 0}
+            style={inputStyle}
+            size={Math.min(8, Math.max(3, symbols.length))}
+          >
+            {symbols.length === 0 ? (
+              <option value="">No symbols found</option>
+            ) : (
+              symbols.map((item) => (
+                <option key={item.symbol} value={item.symbol}>
+                  {item.symbol} · {item.baseAsset}/{item.quoteAsset}
+                </option>
+              ))
+            )}
           </select>
         )}
       </div>
 
+      {symbol && (
+        <div
+          style={{
+            marginBottom: '12px',
+            padding: '10px 12px',
+            background: '#0a0a0f',
+            border: '1px solid #2a2a3a',
+            borderRadius: '8px',
+            fontSize: '13px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+          }}
+        >
+          <span style={{ color: '#9ca3af' }}>Current price</span>
+          <span style={{ color: '#00d4ff', fontWeight: 600 }}>
+            {currentPrice === null ? '...' : `${currentPrice.toFixed(2)} USDT`}
+          </span>
+        </div>
+      )}
+
+      <div
+        style={{
+          marginBottom: '12px',
+          padding: '12px',
+          background: '#0a0a0f',
+          border: '1px dashed #2a2a3a',
+          borderRadius: '8px',
+        }}
+      >
+        <p style={{ color: '#9ca3af', fontSize: '13px', margin: '0 0 10px 0' }}>
+          Optional: protective stop-loss and take-profit. If set, the entry uses a Limit order and
+          protection orders are placed after the fill.
+        </p>
+
+        <div style={{ display: 'flex', gap: '10px', marginBottom: '8px' }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ ...labelStyle, fontSize: '12px' }}>Stop-loss (price)</label>
+            <input
+              type="number"
+              step="0.1"
+              value={stopLoss}
+              onChange={(e) => setStopLoss(e.target.value)}
+              placeholder="e.g. 2455"
+              style={inputStyle}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={{ ...labelStyle, fontSize: '12px' }}>Take-profit (price)</label>
+            <input
+              type="number"
+              step="0.1"
+              value={takeProfit}
+              onChange={(e) => setTakeProfit(e.target.value)}
+              placeholder="e.g. 2555"
+              style={inputStyle}
+            />
+          </div>
+        </div>
+        <p style={{ color: '#6b7280', fontSize: '12px', margin: 0 }}>
+          Leave both empty to place a plain Market buy with no protection.
+        </p>
+      </div>
+
       <div style={{ display: 'flex', gap: '12px' }}>
-        <button onClick={() => handleTrade('buy')} disabled={loading !== null || !selectedConnection || !symbol} style={{ flex: 1, padding: '12px', background: '#00d4aa', color: '#0a0a0f', fontWeight: '600', border: 'none', borderRadius: '8px', cursor: 'pointer', opacity: loading === 'buy' ? 0.6 : 1 }}>{loading === 'buy' ? 'Buying...' : 'Buy'}</button>
-        <button onClick={() => handleTrade('sell')} disabled={loading !== null || !selectedConnection || !symbol} style={{ flex: 1, padding: '12px', background: '#ff4757', color: '#ffffff', fontWeight: '600', border: 'none', borderRadius: '8px', cursor: 'pointer', opacity: loading === 'sell' ? 0.6 : 1 }}>{loading === 'sell' ? 'Selling...' : 'Sell'}</button>
+        <button
+          onClick={() => handleTrade('buy')}
+          disabled={loading !== null || !selectedConnection || !symbol}
+          style={{
+            flex: 1,
+            padding: '12px',
+            background: '#00d4aa',
+            color: '#0a0a0f',
+            fontWeight: '600',
+            border: 'none',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            opacity: loading === 'buy' ? 0.6 : 1,
+          }}
+        >
+          {loading === 'buy' ? 'Buying...' : 'Buy'}
+        </button>
+        <button
+          onClick={() => handleTrade('sell')}
+          disabled={loading !== null || !selectedConnection || !symbol}
+          style={{
+            flex: 1,
+            padding: '12px',
+            background: '#ff4757',
+            color: '#ffffff',
+            fontWeight: '600',
+            border: 'none',
+            borderRadius: '8px',
+            cursor: 'pointer',
+            opacity: loading === 'sell' ? 0.6 : 1,
+          }}
+        >
+          {loading === 'sell' ? 'Selling...' : 'Sell'}
+        </button>
       </div>
     </div>
   );
